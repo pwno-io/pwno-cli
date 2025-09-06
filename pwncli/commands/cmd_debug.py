@@ -117,11 +117,21 @@ def _attach_via_mcp(ctx, pid: int, filename: str, script: str, host: str = "127.
     # Set markers similar to pwntools attach return for downstream expectations
     ctx.gift['gdb_pid'] = obj.get("attach", {}).get("pid", pid)
     ctx.gift['gdb_obj'] = 1
+    # Emit attach result marker for Pwno-MCP to parse from stdout
+    try:
+        import sys
+        marker = {
+            "successful": obj.get("successful"),
+            "attach": obj.get("attach"),
+        }
+        print("PWNCLI_ATTACH_RESULT:" + json.dumps(marker), flush=True)
+    except Exception:
+        pass
     ctx.vlog("debug-command --> MCP attach success.")
 
 
-def _check_set_value(ctx, filename, argv, env, tmux, wsl, gnome, attach_mode,
-                     use_gdb, gdb_type, gdb_breakpoint, gdb_script, pause_before_main, hook_file, hook_function, gdb_tbreakpoint):
+def _check_set_value(ctx, filename, argv, env,
+                     gdb_breakpoint, gdb_script, pause_before_main, hook_file, hook_function, gdb_tbreakpoint):
     # set filename
     if not ctx.gift.filename:
         _set_filename(
