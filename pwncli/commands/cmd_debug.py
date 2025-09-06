@@ -10,6 +10,9 @@
 
 
 import os
+import json
+from urllib import request as _urlreq
+from urllib import error as _urlerr
 import re
 import tempfile
 import threading
@@ -17,47 +20,20 @@ import threading
 import click
 from pwn import ELF, context, pause, sleep, which
 from pwnlib.atexit import register
-from pwnlib.gdb import attach
 from pwnlib.util.safeeval import expr
 
 from ..cli import _set_filename, pass_environ
 from ..utils.cli_misc import (CurrentGadgets, get_current_codebase_addr,
                                    get_current_libcbase_addr)
 from ..utils.config import try_get_config_data_by_key
-from ..utils.misc import _in_tmux, _in_wsl, ldd_get_libc_path, _Inner_Dict
+from ..utils.misc import ldd_get_libc_path, _Inner_Dict
 
 _NO_TERMINAL = 0
-_USE_TMUX = 1
-_USE_OTHER_TERMINALS = 2
-_USE_GNOME_TERMINAL = 4
 
 
 def __recover(f, c):
     with open(f, "wb") as f2:
         f2.write(c)
-
-
-def _set_gdb_type(pwncli_path, gdb_type):
-    if gdb_type == 'auto':
-        return None
-    dirname = os.path.join(pwncli_path, "conf")
-
-    if gdb_type == "pwndbg":
-        gdbfile = ".gdbinit-pwndbg"
-    elif gdb_type == "gef":
-        gdbfile = ".gdbinit-gef"
-    else:
-        gdbfile = ".gdbinit-peda"
-
-    fullpath = os.path.join(dirname, gdbfile)
-    targpath = os.path.expanduser("~/.gdbinit")
-    oldcontent = b""
-    with open(targpath, "rb") as f:
-        oldcontent = f.read()
-    with open(targpath, "wb") as f:
-        with open(fullpath, "rb") as f2:
-            f.write(f2.read())
-    return oldcontent, targpath
 
 
 def _parse_env(ctx, env: str):
@@ -92,117 +68,59 @@ def _parse_env(ctx, env: str):
     return res
 
 
-def _set_terminal(ctx, p, flag, attach_mode, use_gdb, gdb_type, script, is_file, gdb_script):
-    terminal = None
-    dirname = os.path.dirname(ctx.gift['filename'])
+def _set_terminal(*args, **kwargs):
+    raise RuntimeError("Terminal-based attach is disabled in Pwno-MCP mode")
 
-    if flag & _USE_TMUX:  # use tmux
-        terminal = ['tmux', 'splitw', '-h']
-    elif flag & _USE_GNOME_TERMINAL:
-        terminal = ["gnome-terminal", "--", "sh", "-c"]
-    # use cmd.exe to launch wt.exe bash.exe ...
-    elif (flag & _USE_OTHER_TERMINALS) and which('cmd.exe'):
-        if is_file:
-            gdbcmd = " {}\"".format("-x " + gdb_script)
+
+def _attach_via_mcp(ctx, pid: int, filename: str, script: str, host: str = "127.0.0.1", port: int = 5501):
+    """Attach to running process via Pwno-MCP /attach API instead of spawning gdb terminal."""
+    # Split script into pre/after commands; send continue-like commands after attach
+    pre_cmds = []
+    after_cmds = []
+    for line in (script or '').splitlines():
+        cmd = line.strip()
+        if not cmd:
+            continue
+        if cmd in ("c", "cont", "continue"):  # run after successful attach
+            after_cmds.append("continue")
         else:
-            ex_script = ''
-            for line in script.rstrip("\nc\n").split('\n'):
-                if line:
-                    ex_script += "-ex '{}' ".format(line)
+            pre_cmds.append(cmd)
 
-            gdbcmd = " {}\"".format(ex_script)
-        cmd = "cmd.exe /c start {} -c " + \
-            "\"cd {} && gdb -q attach {}".format(dirname, p.proc.pid) + gdbcmd
+    payload = {
+        "where": filename,
+        "pre": pre_cmds or None,
+        "pid": int(pid),
+        "after": after_cmds or None,
+        "script_pid": os.getpid(),
+    }
 
-        if attach_mode == 'wsl-b' and which('bash.exe'):
-            ctx.vlog2(
-                "debug-command --> Tips: Something error will happen if bash.exe not represent the default distribution.")
-            cmd_use = cmd.format('bash.exe')
-            ctx.vlog('debug-command --> Exec os.system({})'.format(cmd_use))
-            os.system(cmd_use)
-            ctx.gift['gdb_obj'] = 1
-            return
-        elif attach_mode == "wsl-w":
-            distro_name = os.getenv("WSL_DISTRO_NAME")
-            cmd_use = cmd.format("wsl.exe -d {} bash".format(distro_name))
-            ctx.vlog('debug-command --> Exec os.system({})'.format(cmd_use))
-            os.system(cmd_use)
-            ctx.gift['gdb_obj'] = 1
-            return
-        else:
-            distro_name = os.getenv('WSL_DISTRO_NAME')
-            if not distro_name:
-                ctx.abort(
-                    'debug-command --> Cannot get distro name in wsl, please check your env!')
+    url = f"http://{host}:{port}/attach"
+    data = json.dumps(payload).encode("utf-8")
+    req = _urlreq.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
 
-            if not re.search("ubuntu-\d\d.\d\d", distro_name, re.I):
-                ctx.vlog2('debug-command --> Warn: The distribution name is not Ubuntu-XX.XX.')
-
-            ctx.vlog2(
-                "debug-command --> Find wsl distro, name '{}'".format(distro_name))
-            ubuntu_exe_name = distro_name.lower().replace("-", "").replace(".", "") + ".exe"
-
-            if attach_mode == 'wsl-u' and which(ubuntu_exe_name):
-                cmd_use = cmd.format(ubuntu_exe_name)
-                ctx.vlog('debug-command --> Exec os.system({})'.format(cmd_use))
-                os.system(cmd_use)
-                ctx.gift['gdb_obj'] = 1
-                return  # return
-            elif attach_mode == 'wsl-wts' and which("wt.exe"):
-                cmd_use = cmd.replace("cmd.exe /c start", "cmd.exe /c").\
-                    format(
-                        "wt.exe -w 0 split-pane -v wsl.exe -d {} bash".format(distro_name))
-                ctx.vlog('debug-command --> Exec os.system({})'.format(cmd_use))
-                os.system(cmd_use)
-                ctx.gift['gdb_obj'] = 1
-                return  # return
-
-            elif attach_mode == 'wsl-o' and which('open-wsl.exe'):
-                terminal = ['open-wsl.exe', '-b',
-                            '-d {}'.format(distro_name), '-c']
-            elif attach_mode == 'wsl-wt' and which('wt.exe'):
-                terminal = ['cmd.exe', '/c', 'start', 'wt.exe', '-d', '\\\\wsl$\\{}{}'.format(distro_name, dirname.replace('/', '\\')),
-                            'wsl.exe', '-d', distro_name, 'bash', '-c']
-            else:
-                ctx.vlog2(
-                    'debug-command --> Wsl mode cannot launch a window, check whether the .exe in PATH.')
-    gdb_type_res = None
+    ctx.vlog(f"debug-command --> MCP attach POST {url} payload: {payload}")
     try:
-        if terminal:
-            context.terminal = terminal
-            ctx.vlog(
-                "debug-command --> Set terminal: '{}'".format(' '.join(terminal)))
-            gdb_type_res = _set_gdb_type(ctx.pwncli_path, gdb_type)
-            gdb_pid, gdb_obj = attach(target=p, gdbscript=script, api=True)
-            ctx.gift['gdb_pid'] = gdb_pid
-            ctx.gift['gdb_obj'] = gdb_obj
+        with _urlreq.urlopen(req, timeout=10) as resp:
+            resp_body = resp.read().decode("utf-8")
+            ctx.vlog2(f"debug-command --> MCP attach response: {resp_body}")
+            obj = json.loads(resp_body)
+    except _urlerr.HTTPError as e:
+        ctx.abort(f"debug-command --> MCP attach HTTPError: {e.code} {e.reason}")
+    except _urlerr.URLError as e:
+        ctx.abort(f"debug-command --> MCP attach URLError: {e.reason}")
+    except Exception as e:
+        ctx.abort(f"debug-command --> MCP attach error: {e}")
 
-        else:
-            if use_gdb:
-                ctx.vlog2(
-                    "debug-command --> No tmux, no wsl, but use the pwntools' default terminal to use gdb because of 'use-gdb' enabled.")
-                if _in_tmux():
-                    context.terminal = ["tmux", "splitw", "-h"]
-                    ctx.vlog2("debug-command --> Detected in tmux when use -u option.")
-                elif which("gnome-terminal"):
-                    context.terminal = ["gnome-terminal", "--", "sh", "-c"]
-                    ctx.vlog2("debug-command --> Detected in gnome when use -u option.")
-                gdb_pid, gdb_obj = attach(target=p, gdbscript=script, api=True)
-                ctx.gift['gdb_pid'] = gdb_pid
-                ctx.gift['gdb_obj'] = gdb_obj
-            else:
-                ctx.vlog2(
-                    "debug-command --> Terminal not set, no tmux or wsl would be used.")
-    except:
-        ctx.verrlog("debug-command --> Catch gdb error.")
-    finally:
-        # recover gdbinit file
-        if gdb_type_res:
-            ctx.vlog("debug-command --> Recover gdbinit file.")
-            __recover(gdb_type_res[1], gdb_type_res[0])
+    if not obj.get("successful"):
+        ctx.abort(f"debug-command --> MCP attach failed: {obj}")
+
+    # Set markers similar to pwntools attach return for downstream expectations
+    ctx.gift['gdb_pid'] = obj.get("attach", {}).get("pid", pid)
+    ctx.gift['gdb_obj'] = 1
+    ctx.vlog("debug-command --> MCP attach success.")
 
 
-def _check_set_value(ctx, filename, argv, env, use_tmux, use_wsl, use_gnome, attach_mode,
+def _check_set_value(ctx, filename, argv, env, tmux, wsl, gnome, attach_mode,
                      use_gdb, gdb_type, gdb_breakpoint, gdb_script, pause_before_main, hook_file, hook_function, gdb_tbreakpoint):
     # set filename
     if not ctx.gift.filename:
@@ -222,50 +140,7 @@ def _check_set_value(ctx, filename, argv, env, use_tmux, use_wsl, use_gnome, att
     else:
         argv = []
 
-    # detect attach_mode
-    __attachmode_mapping = {
-        "t": "tmux",
-        "a": "auto",
-        "b": "wsl-b",
-        "u": "wsl-u",
-        "wt": "wsl-wt",
-        "wts": "wsl-wts",
-        "w": "wsl-w",
-        "o": "wsl-o",
-    }
-    for _k, _v in __attachmode_mapping.items():
-        if attach_mode == _k:
-            attach_mode = _v
-
-    if attach_mode == "auto":
-        if try_get_config_data_by_key(ctx.config_data, "debug", "attach_mode"):
-            attach_mode = try_get_config_data_by_key(
-                ctx.config_data, "debug", "attach_mode")
-            assert (attach_mode in (['auto', 'tmux', 'wsl-b', 'wsl-u', 'wsl-o',
-                    'wsl-wt', 'wsl-wts', 'wsl-w'])), "wrong config of 'attach_mode'"
-
-    if attach_mode.startswith('wsl'):
-        use_wsl = True
-
-    # check
-    t_flag = _NO_TERMINAL
-    # check tmux
-    if use_tmux:
-        if not _in_tmux():
-            ctx.abort(
-                msg="debug-command 'tmux' --> Not in tmux, please launch tmux first!")
-        t_flag = _USE_TMUX
-    # check wsl
-    elif use_wsl:
-        if not _in_wsl():
-            ctx.abort(
-                msg="debug-command 'wsl' --> Not in wsl, the option -w is only used for wsl!")
-        t_flag = _USE_OTHER_TERMINALS
-    elif use_gnome:
-        if not which("gnome-terminal"):
-            ctx.abort(
-                msg="debug-command 'gnome' --> No gnome-terminal, please install gnome-terminal first!")
-        t_flag = _USE_GNOME_TERMINAL
+    # all terminal-related logic removed in MCP mode
 
     # process gdb-scripts
     is_file = False
@@ -533,35 +408,7 @@ int %s()
             with open(gdb_script, "wt", encoding="utf-8") as _f:
                 _f.write(script)
 
-    # set gdb-type
-    if t_flag == _NO_TERMINAL and gdb_type != "auto":
-        if _in_tmux():
-            t_flag = _USE_TMUX
-        elif _in_wsl():
-            t_flag = _USE_OTHER_TERMINALS
-        else:
-            use_gdb = True
-            ctx.vlog2(
-                "debug-command --> set 'gdb_type' but not in tmux or in wsl, so set 'use_gdb' True.")
-
-    # set attach-mode 'auto'
-    if attach_mode == 'auto':
-        if t_flag == _USE_TMUX or (_in_tmux() and t_flag != _USE_OTHER_TERMINALS):
-            attach_mode = 'tmux'
-        elif which("wt.exe"):
-            attach_mode = 'wsl-wt'
-        elif which("wsl.exe"):
-            attach_mode = "wsl-w"
-        elif which('open-wsl.exe'):
-            attach_mode = 'wsl-o'
-        elif which('bash.exe') is None:
-            attach_mode = 'wsl-u'
-        else:
-            attach_mode = 'wsl-b'  # don't know whether bash.exe is correct
-
-    # set terminal
-    _set_terminal(ctx, ctx.gift['io'], t_flag, attach_mode,
-                  use_gdb, gdb_type, script, is_file, gdb_script)
+    _attach_via_mcp(ctx, ctx.gift['io'].proc.pid, filename, script)
 
     if pause_before_main:
         pause()  # avoid read from stdin
@@ -585,12 +432,7 @@ int %s()
 @click.option('-p', '--pause', '--pause-before-main', "pause_before_main", is_flag=True, show_default=True, help="Pause before main is called or not, which is helpful for gdb attach.")
 @click.option('-f', '-hf', '--hook-file', "hook_file", type=str,  default=None, required=False, help="Specify a hook.c file, where you write some functions to hook.")
 @click.option('-H', '-HF', '--hook-function', "hook_function", default=[], type=str, multiple=True, show_default=True, help="The functions you want to hook would be out of work.")
-@click.option('-t', '--use-tmux', '--tmux', "tmux", is_flag=True, show_default=True, help="Use tmux to gdb-debug or not.")
-@click.option('-w', '--use-wsl', '--wsl', "wsl", is_flag=True, show_default=True, help="Use wsl to pop up windows for gdb-debug or not.")
-@click.option('-g', '--use-gnome', '--gnome', "gnome", is_flag=True, show_default=True, help="Use gnome terminal to pop up windows for gdb-debug or not.")
-@click.option('-m', '-am', '--attach-mode', "attach_mode", type=click.Choice(['auto', 'tmux', 'wsl-b', 'wsl-u', 'wsl-o', 'wsl-wt', 'wsl-wts', 'wsl-w', 'a', 't', 'w', 'wt', 'wts', 'b', 'o', 'u']), nargs=1, default='auto', show_default=True, help="Gdb attach mode, wsl: bash.exe | wsl: ubuntu1x04.exe | wsl: open-wsl.exe | wsl: wt.exe wsl.exe")
-@click.option('-u', '-ug', '--use-gdb', "use_gdb", is_flag=True, show_default=True, help="Use gdb possibly.")
-@click.option('-G', '-gt', '--gdb-type', "gdb_type", type=click.Choice(['auto', 'pwndbg', 'gef', 'peda']), nargs=1, default='auto', help="Select a gdb plugin.")
+  
 @click.option('-b', '-gb', '--gdb-breakpoint', "gdb_breakpoint", default=[], type=str, multiple=True, show_default=True, help="Set gdb breakpoints while gdb is used. Multiple breakpoints are supported.")
 @click.option('-T', '-tb', '--gdb-tbreakpoint', "gdb_tbreakpoint", default=[], type=str, multiple=True, show_default=True, help="Set gdb temporary breakpoints while gdb is used. Multiple tbreakpoints are supported.")
 @click.option('-s', '-gs', '--gdb-script', "gdb_script", default=None, type=str, show_default=True, help="Set gdb commands like '-ex' or '-x' while gdb-debug is used, the content will be passed to gdb and use ';' to split lines. Besides eval-commands, file path is supported.")
@@ -599,8 +441,7 @@ int %s()
 @click.option('-v', '--verbose', count=True, help="Show more info or not.")
 @pass_environ
 def cli(ctx, verbose, filename, argv, env, gdb_tbreakpoint,
-        tmux, wsl, gnome, attach_mode, use_gdb, gdb_type, gdb_breakpoint, gdb_script,
-        no_log, no_stop, pause_before_main, hook_file, hook_function):
+        gdb_breakpoint, gdb_script, no_log, no_stop, pause_before_main, hook_file, hook_function):
     """FILENAME: The ELF filename.
 
     \b
@@ -624,12 +465,7 @@ def cli(ctx, verbose, filename, argv, env, gdb_tbreakpoint,
     args.gdb_breakpoint = gdb_breakpoint
     args.gdb_tbreakpoint = gdb_tbreakpoint
     args.gdb_script = gdb_script
-    args.tmux = tmux
-    args.wsl = wsl
-    args.gnome = gnome
-    args.attach_mode = attach_mode
-    args.use_gdb = use_gdb
-    args.gdb_type = gdb_type
+    # terminal-related args removed in MCP mode
     args.pause_before_main = pause_before_main
     args.hook_file = hook_file
     args.hook_function = hook_function
@@ -648,6 +484,6 @@ def cli(ctx, verbose, filename, argv, env, gdb_tbreakpoint,
     ctx.vlog("debug-command --> Set 'context.log_level': {}".format(ll))
 
     # set value
-    _check_set_value(ctx, filename, argv, env, tmux, wsl, gnome, attach_mode,
-                     use_gdb, gdb_type, gdb_breakpoint, gdb_script, pause_before_main,
+    _check_set_value(ctx, filename, argv, env,
+                     gdb_breakpoint, gdb_script, pause_before_main,
                      hook_file, hook_function, gdb_tbreakpoint)
