@@ -1,5 +1,5 @@
-This is a fork of RoderickChan's pwncli for LLMs binary research capability with [pwno-mcp](oss.pwno,io/pwno-mcp)
----
+*This is a fork of RoderickChan's pwncli for LLMs binary research capability with [pwno-mcp](oss.pwno,io/pwno-mcp)*
+
 - [Preface](#preface)
 - [Introduction](#introduction)
 - [Installation](#installation)
